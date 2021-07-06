@@ -124,25 +124,6 @@ impl<R: RoomHandler + 'static> RoomAny for Mutex<RoomInner<R>> {
     }
 }
 
-// TODO check if useful
-impl<R: RoomHandler + 'static> RoomAny for Room<R> {
-    fn on_message(&self, sender: Sender, msg: Message) -> ws::Result<Relocation> {
-        self.0.on_message(sender, msg)
-    }
-
-    fn broadcast(&self, msg: Message) -> ws::Result<()> {
-        self.0.broadcast(msg)
-    }
-
-    fn add(&self, sender: Sender, identity: Box<dyn Any>) {
-        self.0.add(sender, identity)
-    }
-
-    fn remove(&self, socket_id: (Token, u32)) {
-        self.0.remove(socket_id)
-    }
-}
-
 /// TODO temporary struct that should be merged with [Context]
 pub struct MembersAccess<'a, Guest> {
     members: &'a mut [(Guest, Sender)],
@@ -316,9 +297,4 @@ where
         }
     })
     .unwrap()
-}
-
-#[cfg(test)]
-mod tests {
-    // TODO: E2E tests ? Unit tests are probably unsuited
 }
