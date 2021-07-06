@@ -79,7 +79,7 @@ impl<R: RoomHandler + 'static> RoomAny for Mutex<RoomInner<R>> {
 
         let mut relocation = None;
 
-        // TODO clean up while merging
+        // TODO clean up while merging [MembersAccess]
         let todo = room
             .members
             .iter()
@@ -88,17 +88,14 @@ impl<R: RoomHandler + 'static> RoomAny for Mutex<RoomInner<R>> {
         let socket = Context {
             sender: &sender,
             members: &todo,
-            relocation: &mut relocation,
-        };
-
-        handler.on_message(
-            socket,
-            MembersAccess {
+            members_a: MembersAccess {
                 members: &mut room.members,
                 me: (sender.token(), sender.connection_id()),
             },
-            msg,
-        )?;
+            relocation: &mut relocation,
+        };
+
+        handler.on_message(socket, msg)?;
 
         Ok(relocation)
     }
@@ -124,8 +121,8 @@ impl<R: RoomHandler + 'static> RoomAny for Mutex<RoomInner<R>> {
     }
 }
 
-/// TODO temporary struct that should be merged with [Context]
-pub struct MembersAccess<'a, Guest> {
+/// TODO merge with [Context]
+struct MembersAccess<'a, Guest> {
     members: &'a mut [(Guest, Sender)],
     me: (Token, u32),
 }
@@ -145,13 +142,19 @@ impl<Guest> MembersAccess<'_, Guest> {
     }
 }
 
-pub struct Context<'a, Guest> {
+pub struct Context<'a, 'm, Guest> {
     sender: &'a Sender,
     members: &'a [(PhantomData<Guest>, Sender)],
+    members_a: MembersAccess<'m, Guest>,
     relocation: &'a mut Relocation,
 }
 
-impl<Guest> Context<'_, Guest> {
+impl<Guest> Context<'_, '_, Guest> {
+    /// Returns the identity of the client associated with this [Context]
+    pub fn identity(&mut self) -> &mut Guest {
+        self.members_a.identity()
+    }
+
     /// Sends a message to the client associated to this [Context], that is, the one who received
     /// the message.
     #[inline]
@@ -228,12 +231,7 @@ pub trait RoomHandler {
     /// [Guest]: RoomHandler::Guest
     type Guest;
 
-    fn on_message(
-        &mut self,
-        socket: Context<Self::Guest>,
-        m: MembersAccess<Self::Guest>,
-        msg: Message,
-    ) -> ws::Result<()>;
+    fn on_message(&mut self, socket: Context<Self::Guest>, msg: Message) -> ws::Result<()>;
 }
 
 /// A simple [RoomHandler] that wraps a function or closure that will be called when receiving a
@@ -253,18 +251,11 @@ impl<F, G> AdHoc<F, G> {
     }
 }
 
-impl<Guest, F: FnMut(Context<Guest>, MembersAccess<Guest>, Message) -> ws::Result<()>> RoomHandler
-    for AdHoc<F, Guest>
-{
+impl<Guest, F: FnMut(Context<Guest>, Message) -> ws::Result<()>> RoomHandler for AdHoc<F, Guest> {
     type Guest = Guest;
 
-    fn on_message(
-        &mut self,
-        socket: Context<Self::Guest>,
-        m: MembersAccess<Self::Guest>,
-        msg: Message,
-    ) -> ws::Result<()> {
-        self.0(socket, m, msg)
+    fn on_message(&mut self, socket: Context<Self::Guest>, msg: Message) -> ws::Result<()> {
+        self.0(socket, msg)
     }
 }
 

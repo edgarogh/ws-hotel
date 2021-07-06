@@ -1,5 +1,5 @@
 use ws::Message;
-use ws_hotel::{AdHoc, Context, MembersAccess, Room, RoomHandler};
+use ws_hotel::{AdHoc, Context, Room, RoomHandler};
 
 struct ChatRoom {
     name: String,
@@ -9,13 +9,8 @@ struct ChatRoom {
 impl RoomHandler for ChatRoom {
     type Guest = String;
 
-    fn on_message(
-        &mut self,
-        cx: Context<Self::Guest>,
-        mut m: MembersAccess<Self::Guest>,
-        msg: Message,
-    ) -> ws::Result<()> {
-        let who = &*m.identity();
+    fn on_message(&mut self, mut cx: Context<Self::Guest>, msg: Message) -> ws::Result<()> {
+        let who: &_ = cx.identity();
 
         let message = format!("{}: {}", who, msg.as_text().unwrap_or_default());
         cx.broadcast(&*message)?;
@@ -55,37 +50,33 @@ pub fn main() {
 
     ws_hotel::listen(
         "localhost:8080",
-        AdHoc::new(
-            move |mut cx: Context<Option<String>>,
-                  mut m: MembersAccess<Option<String>>,
-                  msg: Message| {
-                let username = m.identity();
+        AdHoc::new(move |mut cx: Context<Option<String>>, msg: Message| {
+            let username = cx.identity();
 
-                let msg = msg.as_text().unwrap_or_default();
+            let msg = msg.as_text().unwrap_or_default();
 
-                if username.is_none() {
-                    return if let Some(username_msg) = msg.strip_prefix("/nick ") {
-                        println!("{:?} is joining", username_msg);
-                        *username = Some(username_msg.into());
-                        Ok(())
-                    } else {
-                        cx.send("You haven't chosen a name yet")
-                    };
-                }
-
-                if let Some(room) = msg.strip_prefix("/join ") {
-                    if let Some(username) = username.take() {
-                        let room = chat_rooms.find_or_create_room(room);
-                        cx.relocate(room, username);
-
-                        Ok(())
-                    } else {
-                        cx.send("You're not logged in !")
-                    }
+            if username.is_none() {
+                return if let Some(username_msg) = msg.strip_prefix("/nick ") {
+                    println!("{:?} is joining", username_msg);
+                    *username = Some(username_msg.into());
+                    Ok(())
                 } else {
-                    cx.send("Type `/join <room>` to join a chat room.")
+                    cx.send("You haven't chosen a name yet")
+                };
+            }
+
+            if let Some(room) = msg.strip_prefix("/join ") {
+                if let Some(username) = username.take() {
+                    let room = chat_rooms.find_or_create_room(room);
+                    cx.relocate(room, username);
+
+                    Ok(())
+                } else {
+                    cx.send("You're not logged in !")
                 }
-            },
-        ),
+            } else {
+                cx.send("Type `/join <room>` to join a chat room.")
+            }
+        }),
     );
 }
