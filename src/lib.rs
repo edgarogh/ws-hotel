@@ -7,7 +7,9 @@ use std::marker::PhantomData;
 use std::net::ToSocketAddrs;
 use std::sync::{Arc, Mutex};
 use ws::util::Token;
-use ws::{CloseCode, Message, Sender};
+use ws::Sender;
+
+pub use ws::{self, CloseCode, Handshake, Message};
 
 /// A room in which websocket clients can be moved
 ///
@@ -18,6 +20,59 @@ pub struct Room<R: RoomHandler>(Arc<Mutex<RoomInner<R>>>);
 struct RoomInner<R: RoomHandler> {
     handler: R,
     members: Vec<(R::Guest, Sender)>,
+}
+
+trait RelocationJoinable {
+    type Output;
+
+    fn join_relocation(self, r: Relocation) -> Self::Output;
+}
+
+impl RelocationJoinable for () {
+    type Output = Relocation;
+
+    fn join_relocation(self, r: Relocation) -> Self::Output {
+        r
+    }
+}
+
+impl RelocationJoinable for ws::Result<()> {
+    type Output = ws::Result<Relocation>;
+
+    fn join_relocation(self, r: Relocation) -> Self::Output {
+        self.map(|()| r)
+    }
+}
+
+impl<R: RoomHandler> RoomInner<R> {
+    fn with_context<F: FnOnce(&mut R, Context<R::Guest>) -> O, O: RelocationJoinable>(
+        &mut self,
+        sender: &Sender,
+        f: F,
+    ) -> O::Output {
+        let mut relocation = None;
+
+        // TODO: remove
+        //     Instead of allocating, use unsafe wrapper around HashMap that allows value mutation
+        //     but no other kind of mutation. Thus, it will be possible to use `broadcast` or
+        //     access the list of Senders in the room without preventing mutable access to the
+        //     current identity.
+        let todo = self
+            .members
+            .iter()
+            .map(|(_, v)| (PhantomData, v.clone()))
+            .collect::<Vec<_>>();
+
+        let cx = Context {
+            sender,
+            members: &todo,
+            members_a: &mut self.members,
+            me: (sender.token(), sender.connection_id()),
+            relocation: &mut relocation,
+        };
+
+        f(&mut self.handler, cx).join_relocation(relocation)
+    }
 }
 
 impl<R: RoomHandler> Room<R> {
@@ -64,7 +119,9 @@ impl<R: RoomHandler> Room<R> {
 type Relocation = Option<(Box<dyn Any>, Arc<dyn RoomAny>)>;
 
 trait RoomAny {
-    fn on_message(&self, sender: Sender, msg: Message) -> ws::Result<Relocation>;
+    fn on_open(&self, sender: &Sender, shake: Handshake) -> ws::Result<Relocation>;
+    fn on_message(&self, sender: &Sender, msg: Message) -> ws::Result<Relocation>;
+    fn on_close(&self, sender: &Sender, code: CloseCode, reason: &str) -> Relocation;
 
     fn broadcast(&self, msg: Message) -> ws::Result<()>;
     fn add(&self, sender: Sender, identity: Box<dyn Any>);
@@ -72,30 +129,22 @@ trait RoomAny {
 }
 
 impl<R: RoomHandler + 'static> RoomAny for Mutex<RoomInner<R>> {
-    fn on_message(&self, sender: Sender, msg: Message) -> ws::Result<Relocation> {
-        let mut room_guard = self.lock().unwrap();
-        let room = &mut *room_guard;
-        let handler = &mut room.handler;
+    fn on_open(&self, sender: &Sender, shake: Handshake) -> ws::Result<Relocation> {
+        self.lock()
+            .unwrap()
+            .with_context(sender, move |h, cx| h.on_open(cx, shake))
+    }
 
-        let mut relocation = None;
+    fn on_message(&self, sender: &Sender, msg: Message) -> ws::Result<Relocation> {
+        self.lock()
+            .unwrap()
+            .with_context(sender, move |h, cx| h.on_message(cx, msg))
+    }
 
-        // TODO clean up while merging [MembersAccess]
-        let todo = room
-            .members
-            .iter()
-            .map(|(_, v)| (PhantomData, v.clone()))
-            .collect::<Vec<_>>();
-        let socket = Context {
-            sender: &sender,
-            members: &todo,
-            members_a: &mut room.members,
-            me: (sender.token(), sender.connection_id()),
-            relocation: &mut relocation,
-        };
-
-        handler.on_message(socket, msg)?;
-
-        Ok(relocation)
+    fn on_close(&self, sender: &Sender, code: CloseCode, reason: &str) -> Relocation {
+        self.lock()
+            .unwrap()
+            .with_context(sender, move |h, cx| h.on_close(cx, code, reason))
     }
 
     fn broadcast(&self, msg: Message) -> ws::Result<()> {
@@ -176,21 +225,32 @@ struct Handler {
     room: Arc<dyn RoomAny>,
 }
 
-impl ws::Handler for Handler {
-    fn on_message(&mut self, msg: Message) -> ws::Result<()> {
-        let relocation = self.room.on_message(self.sender.clone(), msg)?;
-
-        if let Some((identity, room)) = relocation {
+impl Handler {
+    pub fn relocate(&mut self, r: Relocation) {
+        if let Some((identity, room)) = r {
             self.room
                 .remove((self.sender.token(), self.sender.connection_id()));
             self.room = room;
             self.room.add(self.sender.clone(), identity);
         }
+    }
+}
 
-        Ok(())
+impl ws::Handler for Handler {
+    fn on_open(&mut self, shake: Handshake) -> ws::Result<()> {
+        self.room
+            .on_open(&self.sender, shake)
+            .map(|r| self.relocate(r))
     }
 
-    fn on_close(&mut self, _code: CloseCode, _reason: &str) {
+    fn on_message(&mut self, msg: Message) -> ws::Result<()> {
+        self.room
+            .on_message(&self.sender, msg)
+            .map(|r| self.relocate(r))
+    }
+
+    fn on_close(&mut self, code: CloseCode, reason: &str) {
+        self.relocate(self.room.on_close(&self.sender, code, reason));
         self.room
             .remove((self.sender.token(), self.sender.connection_id()));
     }
@@ -218,7 +278,13 @@ pub trait RoomHandler {
     /// [Guest]: RoomHandler::Guest
     type Guest;
 
-    fn on_message(&mut self, socket: Context<Self::Guest>, msg: Message) -> ws::Result<()>;
+    fn on_open(&mut self, _cx: Context<Self::Guest>, _shake: Handshake) -> ws::Result<()> {
+        Ok(())
+    }
+
+    fn on_message(&mut self, cx: Context<Self::Guest>, msg: Message) -> ws::Result<()>;
+
+    fn on_close(&mut self, _cx: Context<Self::Guest>, _code: CloseCode, _reason: &str) {}
 }
 
 /// A simple [RoomHandler] that wraps a function or closure that will be called when receiving a
@@ -241,8 +307,8 @@ impl<F, G> AdHoc<F, G> {
 impl<Guest, F: FnMut(Context<Guest>, Message) -> ws::Result<()>> RoomHandler for AdHoc<F, Guest> {
     type Guest = Guest;
 
-    fn on_message(&mut self, socket: Context<Self::Guest>, msg: Message) -> ws::Result<()> {
-        self.0(socket, msg)
+    fn on_message(&mut self, cx: Context<Self::Guest>, msg: Message) -> ws::Result<()> {
+        self.0(cx, msg)
     }
 }
 

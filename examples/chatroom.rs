@@ -1,5 +1,4 @@
-use ws::Message;
-use ws_hotel::{AdHoc, Context, Room, RoomHandler};
+use ws_hotel::{AdHoc, CloseCode, Context, Message, Room, RoomHandler};
 
 struct ChatRoom {
     name: String,
@@ -16,6 +15,10 @@ impl RoomHandler for ChatRoom {
         cx.broadcast(&*message)?;
         self.message.push(message);
         Ok(())
+    }
+
+    fn on_close(&mut self, mut cx: Context<Self::Guest>, code: CloseCode, reason: &str) {
+        println!("{} left ({:?})", cx.identity(), (code, reason));
     }
 }
 
