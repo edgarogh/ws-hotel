@@ -88,10 +88,8 @@ impl<R: RoomHandler + 'static> RoomAny for Mutex<RoomInner<R>> {
         let socket = Context {
             sender: &sender,
             members: &todo,
-            members_a: MembersAccess {
-                members: &mut room.members,
-                me: (sender.token(), sender.connection_id()),
-            },
+            members_a: &mut room.members,
+            me: (sender.token(), sender.connection_id()),
             relocation: &mut relocation,
         };
 
@@ -121,38 +119,27 @@ impl<R: RoomHandler + 'static> RoomAny for Mutex<RoomInner<R>> {
     }
 }
 
-/// TODO merge with [Context]
-struct MembersAccess<'a, Guest> {
-    members: &'a mut [(Guest, Sender)],
-    me: (Token, u32),
-}
-
-impl<Guest> MembersAccess<'_, Guest> {
-    pub fn identity(&mut self) -> &mut Guest {
-        // TODO memoize this function ? probably requires unsafe code
-
-        let sender = self.me;
-
-        &mut self
-            .members
-            .iter_mut()
-            .find(move |(_, s)| (s.token(), s.connection_id()) == sender)
-            .expect("guest not in room")
-            .0
-    }
-}
-
 pub struct Context<'a, 'm, Guest> {
     sender: &'a Sender,
     members: &'a [(PhantomData<Guest>, Sender)],
-    members_a: MembersAccess<'m, Guest>,
+    members_a: &'m mut [(Guest, Sender)],
+    me: (Token, u32),
     relocation: &'a mut Relocation,
 }
 
 impl<Guest> Context<'_, '_, Guest> {
     /// Returns the identity of the client associated with this [Context]
     pub fn identity(&mut self) -> &mut Guest {
-        self.members_a.identity()
+        // TODO memoize this function ? probably requires unsafe code
+
+        let sender = self.me;
+
+        &mut self
+            .members_a
+            .iter_mut()
+            .find(move |(_, s)| (s.token(), s.connection_id()) == sender)
+            .expect("guest not in room")
+            .0
     }
 
     /// Sends a message to the client associated to this [Context], that is, the one who received
