@@ -8,17 +8,32 @@ struct ChatRoom {
 impl RoomHandler for ChatRoom {
     type Guest = String;
 
-    fn on_message(&mut self, mut cx: Context<Self::Guest>, msg: Message) -> ws::Result<()> {
-        let who: &_ = cx.identity();
+    fn on_join(&mut self, mut cx: Context<Self::Guest>) -> ws_hotel::Result<()> {
+        let message = format!("[SERVER]: {} entered the room", cx.identity().as_str());
+        cx.broadcast(message)
+    }
 
-        let message = format!("{}: {}", who, msg.as_text().unwrap_or_default());
+    fn on_message(&mut self, mut cx: Context<Self::Guest>, msg: Message) -> ws::Result<()> {
+        let name = cx.identity().as_str();
+
+        let message = format!("{}: {}", name, msg.as_text().unwrap_or_default());
         cx.broadcast(&*message)?;
         self.message.push(message);
         Ok(())
     }
 
-    fn on_close(&mut self, mut cx: Context<Self::Guest>, code: CloseCode, reason: &str) {
-        println!("{} left ({:?})", cx.identity(), (code, reason));
+    fn on_leave(
+        &mut self,
+        mut cx: Context<Self::Guest>,
+        code_and_reason: Option<(CloseCode, &str)>,
+    ) {
+        let name = cx.identity().as_str();
+        let message = format!(
+            "[SERVER]: {} left the room (reason: {:?})",
+            name, code_and_reason,
+        );
+
+        cx.broadcast(message).unwrap();
     }
 }
 

@@ -9,7 +9,7 @@ use std::sync::{Arc, Mutex};
 use ws::util::Token;
 use ws::Sender;
 
-pub use ws::{self, CloseCode, Handshake, Message};
+pub use ws::{self, CloseCode, Handshake, Message, Result};
 
 /// A room in which websocket clients can be moved
 ///
@@ -119,20 +119,21 @@ impl<R: RoomHandler> Room<R> {
 type Relocation = Option<(Box<dyn Any>, Arc<dyn RoomAny>)>;
 
 trait RoomAny {
-    fn on_open(&self, sender: &Sender, shake: Handshake) -> ws::Result<Relocation>;
+    fn on_join(&self, sender: &Sender) -> ws::Result<Relocation>;
     fn on_message(&self, sender: &Sender, msg: Message) -> ws::Result<Relocation>;
-    fn on_close(&self, sender: &Sender, code: CloseCode, reason: &str) -> Relocation;
+    fn on_leave(&self, sender: &Sender, code_and_reason: Option<(CloseCode, &str)>);
 
     fn broadcast(&self, msg: Message) -> ws::Result<()>;
+
     fn add(&self, sender: Sender, identity: Box<dyn Any>);
-    fn remove(&self, socket_id: (Token, u32));
+    fn remove(&self, sender: &Sender);
 }
 
 impl<R: RoomHandler + 'static> RoomAny for Mutex<RoomInner<R>> {
-    fn on_open(&self, sender: &Sender, shake: Handshake) -> ws::Result<Relocation> {
+    fn on_join(&self, sender: &Sender) -> ws::Result<Relocation> {
         self.lock()
             .unwrap()
-            .with_context(sender, move |h, cx| h.on_open(cx, shake))
+            .with_context(sender, move |h, cx| h.on_join(cx))
     }
 
     fn on_message(&self, sender: &Sender, msg: Message) -> ws::Result<Relocation> {
@@ -141,10 +142,12 @@ impl<R: RoomHandler + 'static> RoomAny for Mutex<RoomInner<R>> {
             .with_context(sender, move |h, cx| h.on_message(cx, msg))
     }
 
-    fn on_close(&self, sender: &Sender, code: CloseCode, reason: &str) -> Relocation {
+    fn on_leave(&self, sender: &Sender, code_and_reason: Option<(CloseCode, &str)>) {
         self.lock()
             .unwrap()
-            .with_context(sender, move |h, cx| h.on_close(cx, code, reason))
+            .with_context(sender, move |h, cx| h.on_leave(cx, code_and_reason));
+
+        // TODO "functional" relocation
     }
 
     fn broadcast(&self, msg: Message) -> ws::Result<()> {
@@ -158,13 +161,19 @@ impl<R: RoomHandler + 'static> RoomAny for Mutex<RoomInner<R>> {
 
     fn add(&self, sender: Sender, identity: Box<dyn Any>) {
         let identity = *identity.downcast().unwrap();
-        self.lock().unwrap().members.push((identity, sender))
+        self.lock().unwrap().members.push((identity, sender));
     }
 
-    fn remove(&self, (token, connection_id): (Token, u32)) {
-        self.lock().unwrap().members.retain(|(_, sender)| {
-            !(sender.token() == token && sender.connection_id() == connection_id)
-        });
+    fn remove(&self, sender: &Sender) {
+        let mut lock = self.lock().unwrap();
+
+        let index = lock
+            .members
+            .iter()
+            .position(|(_, s)| s == sender)
+            .expect("attempted to remove member, but it wasn't here");
+
+        lock.members.swap_remove(index);
     }
 }
 
@@ -226,33 +235,38 @@ struct Handler {
 }
 
 impl Handler {
-    pub fn relocate(&mut self, r: Relocation) {
-        if let Some((identity, room)) = r {
-            self.room
-                .remove((self.sender.token(), self.sender.connection_id()));
+    pub fn relocate(&mut self, mut r: Relocation) -> ws::Result<()> {
+        let sender = &self.sender;
+
+        while let Some((identity, room)) = r.take() {
+            self.room.on_leave(sender, None);
+            self.room.remove(sender);
             self.room = room;
-            self.room.add(self.sender.clone(), identity);
+
+            self.room.add(sender.clone(), identity);
+            r = self.room.on_join(sender)?;
         }
+
+        Ok(())
     }
 }
 
 impl ws::Handler for Handler {
-    fn on_open(&mut self, shake: Handshake) -> ws::Result<()> {
-        self.room
-            .on_open(&self.sender, shake)
-            .map(|r| self.relocate(r))
+    fn on_open(&mut self, _shake: Handshake) -> ws::Result<()> {
+        // TODO let user build their `Guest` from the handshake
+
+        Ok(())
     }
 
     fn on_message(&mut self, msg: Message) -> ws::Result<()> {
         self.room
             .on_message(&self.sender, msg)
-            .map(|r| self.relocate(r))
+            .and_then(|r| self.relocate(r))
     }
 
     fn on_close(&mut self, code: CloseCode, reason: &str) {
-        self.relocate(self.room.on_close(&self.sender, code, reason));
-        self.room
-            .remove((self.sender.token(), self.sender.connection_id()));
+        self.room.on_leave(&self.sender, Some((code, reason)));
+        self.room.remove(&self.sender);
     }
 }
 
@@ -278,13 +292,14 @@ pub trait RoomHandler {
     /// [Guest]: RoomHandler::Guest
     type Guest;
 
-    fn on_open(&mut self, _cx: Context<Self::Guest>, _shake: Handshake) -> ws::Result<()> {
+    fn on_join(&mut self, _cx: Context<Self::Guest>) -> ws::Result<()> {
         Ok(())
     }
 
     fn on_message(&mut self, cx: Context<Self::Guest>, msg: Message) -> ws::Result<()>;
 
-    fn on_close(&mut self, _cx: Context<Self::Guest>, _code: CloseCode, _reason: &str) {}
+    fn on_leave(&mut self, _cx: Context<Self::Guest>, _code_and_reason: Option<(CloseCode, &str)>) {
+    }
 }
 
 /// A simple [RoomHandler] that wraps a function or closure that will be called when receiving a
