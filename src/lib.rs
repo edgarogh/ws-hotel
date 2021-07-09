@@ -3,6 +3,7 @@
 //! _Your websocket server, with rooms._
 
 use std::any::Any;
+use std::fmt::{Debug, Formatter};
 use std::marker::PhantomData;
 use std::net::ToSocketAddrs;
 use std::sync::{Arc, Mutex};
@@ -113,6 +114,21 @@ impl<R: RoomHandler> Room<R> {
     #[inline]
     pub fn with<F: FnOnce(&mut R) -> T, T>(&self, f: F) -> T {
         f(&mut self.0.lock().unwrap().handler)
+    }
+}
+
+impl<R: RoomHandler> Debug for Room<R>
+where
+    R: Debug,
+    R::Guest: Debug,
+{
+    fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
+        let lock = self.0.lock().unwrap();
+
+        f.debug_struct("Room")
+            .field("[handler]", &lock.handler)
+            .field("[members]", &lock.members)
+            .finish()
     }
 }
 
@@ -229,6 +245,26 @@ impl<Guest> Context<'_, '_, Guest> {
     }
 }
 
+impl<Guest: Debug> Debug for Context<'_, '_, Guest> {
+    fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
+        // TODO memoize ? move into a non-mut function ? idk
+
+        let sender = self.me;
+
+        let identity = &self
+            .members_a
+            .iter()
+            .find(move |(_, s)| (s.token(), s.connection_id()) == sender)
+            .expect("guest not in room")
+            .0;
+
+        f.debug_struct("Context")
+            .field("sender", &self.sender)
+            .field("[identity]", identity)
+            .finish()
+    }
+}
+
 struct Handler {
     sender: Sender,
     room: Arc<dyn RoomAny>,
@@ -316,6 +352,13 @@ pub struct AdHoc<F, G>(F, PhantomData<G>);
 impl<F, G> AdHoc<F, G> {
     pub fn new(f: F) -> Self {
         Self(f, PhantomData)
+    }
+}
+
+impl<F, G> Debug for AdHoc<F, G> {
+    fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
+        f.debug_tuple(&format!("AdHoc<_, {}>", std::any::type_name::<G>()))
+            .finish()
     }
 }
 

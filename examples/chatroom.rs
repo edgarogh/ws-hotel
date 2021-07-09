@@ -1,5 +1,6 @@
 use ws_hotel::{AdHoc, CloseCode, Context, Message, Room, RoomHandler};
 
+#[derive(Debug)]
 struct ChatRoom {
     name: String,
     message: Vec<String>,
@@ -37,7 +38,7 @@ impl RoomHandler for ChatRoom {
     }
 }
 
-#[derive(Default)]
+#[derive(Debug, Default)]
 struct ChatRooms(Vec<Room<ChatRoom>>);
 
 impl ChatRooms {
@@ -87,6 +88,8 @@ pub fn main() {
                 if let Some(username) = username.take() {
                     let room = chat_rooms.find_or_create_room(room);
                     cx.relocate(room, username);
+
+                    dbg!(&chat_rooms);
 
                     Ok(())
                 } else {
