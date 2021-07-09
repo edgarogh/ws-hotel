@@ -16,7 +16,6 @@ pub use ws::{self, CloseCode, Handshake, Message, Result};
 ///
 /// It effectively contains a user-provided [`RoomHandler`] as R as well as a set of users that
 /// are in the room.
-#[derive(Eq)]
 pub struct Room<R: RoomHandler>(Arc<Mutex<RoomInner<R>>>);
 
 struct RoomInner<R: RoomHandler> {
@@ -24,36 +23,12 @@ struct RoomInner<R: RoomHandler> {
     members: Vec<(R::Guest, Sender)>,
 }
 
-trait RelocationJoinable {
-    type Output;
-
-    fn join_relocation(self, r: Relocation) -> Self::Output;
-}
-
-impl RelocationJoinable for () {
-    type Output = Relocation;
-
-    fn join_relocation(self, r: Relocation) -> Self::Output {
-        r
-    }
-}
-
-impl RelocationJoinable for ws::Result<()> {
-    type Output = ws::Result<Relocation>;
-
-    fn join_relocation(self, r: Relocation) -> Self::Output {
-        self.map(|()| r)
-    }
-}
-
 impl<R: RoomHandler> RoomInner<R> {
-    fn with_context<F: FnOnce(&mut R, Context<R::Guest>) -> O, O: RelocationJoinable>(
+    fn with_context<F: FnOnce(&mut R, Context<R::Guest>) -> O, O>(
         &mut self,
         sender: &Sender,
         f: F,
-    ) -> O::Output {
-        let mut relocation = None;
-
+    ) -> O {
         // TODO: remove
         //     Instead of allocating, use unsafe wrapper around HashMap that allows value mutation
         //     but no other kind of mutation. Thus, it will be possible to use `broadcast` or
@@ -70,10 +45,9 @@ impl<R: RoomHandler> RoomInner<R> {
             members: &todo,
             members_a: &mut self.members,
             me: (sender.token(), sender.connection_id()),
-            relocation: &mut relocation,
         };
 
-        f(&mut self.handler, cx).join_relocation(relocation)
+        f(&mut self.handler, cx)
     }
 }
 
@@ -140,11 +114,26 @@ impl<R: RoomHandler> PartialEq for Room<R> {
     }
 }
 
-type Relocation = Option<(Box<dyn Any>, Arc<dyn RoomAny>)>;
+impl<R: RoomHandler> Eq for Room<R> {}
+
+pub struct Relocation(Arc<dyn RoomAny>, Box<dyn Any>);
+
+impl Relocation {
+    #[must_use]
+    pub fn new<R: RoomHandler>(room: &Room<R>, identity: R::Guest) -> Self
+    where
+        R: 'static,
+        R::Guest: 'static,
+    {
+        Self(Arc::clone(&room.0) as _, Box::new(identity) as _)
+    }
+}
+
+pub type ResultRelocation = ws::Result<Option<Relocation>>;
 
 trait RoomAny {
-    fn on_join(&self, sender: &Sender) -> ws::Result<Relocation>;
-    fn on_message(&self, sender: &Sender, msg: Message) -> ws::Result<Relocation>;
+    fn on_join(&self, sender: &Sender) -> ResultRelocation;
+    fn on_message(&self, sender: &Sender, msg: Message) -> ResultRelocation;
     fn on_leave(&self, sender: &Sender, code_and_reason: Option<(CloseCode, &str)>);
 
     fn broadcast(&self, msg: Message) -> ws::Result<()>;
@@ -154,13 +143,13 @@ trait RoomAny {
 }
 
 impl<R: RoomHandler + 'static> RoomAny for Mutex<RoomInner<R>> {
-    fn on_join(&self, sender: &Sender) -> ws::Result<Relocation> {
+    fn on_join(&self, sender: &Sender) -> ResultRelocation {
         self.lock()
             .unwrap()
             .with_context(sender, move |h, cx| h.on_join(cx))
     }
 
-    fn on_message(&self, sender: &Sender, msg: Message) -> ws::Result<Relocation> {
+    fn on_message(&self, sender: &Sender, msg: Message) -> ResultRelocation {
         self.lock()
             .unwrap()
             .with_context(sender, move |h, cx| h.on_message(cx, msg))
@@ -169,9 +158,7 @@ impl<R: RoomHandler + 'static> RoomAny for Mutex<RoomInner<R>> {
     fn on_leave(&self, sender: &Sender, code_and_reason: Option<(CloseCode, &str)>) {
         self.lock()
             .unwrap()
-            .with_context(sender, move |h, cx| h.on_leave(cx, code_and_reason));
-
-        // TODO "functional" relocation
+            .with_context(sender, move |h, cx| h.on_leave(cx, code_and_reason))
     }
 
     fn broadcast(&self, msg: Message) -> ws::Result<()> {
@@ -206,7 +193,6 @@ pub struct Context<'a, 'm, Guest> {
     members: &'a [(PhantomData<Guest>, Sender)],
     members_a: &'m mut [(Guest, Sender)],
     me: (Token, u32),
-    relocation: &'a mut Relocation,
 }
 
 impl<Guest> Context<'_, '_, Guest> {
@@ -240,17 +226,6 @@ impl<Guest> Context<'_, '_, Guest> {
             .map(|(_, sender)| sender.send(msg.clone()))
             .collect()
     }
-
-    /// Moves the client to a new room
-    pub fn relocate<R>(&mut self, room: &Room<R>, identity: R::Guest)
-    where
-        R: RoomHandler + 'static,
-        R::Guest: Send + 'static,
-    {
-        let room1 = Arc::clone(&room.0);
-
-        *self.relocation = Some((Box::new(identity) as _, room1 as _));
-    }
 }
 
 impl<Guest: Debug> Debug for Context<'_, '_, Guest> {
@@ -279,10 +254,10 @@ struct Handler {
 }
 
 impl Handler {
-    pub fn relocate(&mut self, mut r: Relocation) -> ws::Result<()> {
+    pub fn relocate(&mut self, mut r: Option<Relocation>) -> ws::Result<()> {
         let sender = &self.sender;
 
-        while let Some((identity, room)) = r.take() {
+        while let Some(Relocation(room, identity)) = r.take() {
             self.room.on_leave(sender, None);
             self.room.remove(sender);
             self.room = room;
@@ -336,11 +311,11 @@ pub trait RoomHandler {
     /// [Guest]: RoomHandler::Guest
     type Guest;
 
-    fn on_join(&mut self, _cx: Context<Self::Guest>) -> ws::Result<()> {
-        Ok(())
+    fn on_join(&mut self, _cx: Context<Self::Guest>) -> ResultRelocation {
+        Ok(None)
     }
 
-    fn on_message(&mut self, cx: Context<Self::Guest>, msg: Message) -> ws::Result<()>;
+    fn on_message(&mut self, cx: Context<Self::Guest>, msg: Message) -> ResultRelocation;
 
     fn on_leave(&mut self, _cx: Context<Self::Guest>, _code_and_reason: Option<(CloseCode, &str)>) {
     }
@@ -370,10 +345,10 @@ impl<F, G> Debug for AdHoc<F, G> {
     }
 }
 
-impl<Guest, F: FnMut(Context<Guest>, Message) -> ws::Result<()>> RoomHandler for AdHoc<F, Guest> {
+impl<Guest, F: FnMut(Context<Guest>, Message) -> ResultRelocation> RoomHandler for AdHoc<F, Guest> {
     type Guest = Guest;
 
-    fn on_message(&mut self, cx: Context<Self::Guest>, msg: Message) -> ws::Result<()> {
+    fn on_message(&mut self, cx: Context<Self::Guest>, msg: Message) -> ResultRelocation {
         self.0(cx, msg)
     }
 }

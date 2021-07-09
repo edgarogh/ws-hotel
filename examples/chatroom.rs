@@ -1,4 +1,6 @@
-use ws_hotel::{AdHoc, CloseCode, Context, Message, Room, RoomHandler};
+use ws_hotel::{
+    AdHoc, CloseCode, Context, Message, Relocation, ResultRelocation, Room, RoomHandler,
+};
 
 #[derive(Debug)]
 struct ChatRoom {
@@ -9,18 +11,21 @@ struct ChatRoom {
 impl RoomHandler for ChatRoom {
     type Guest = String;
 
-    fn on_join(&mut self, mut cx: Context<Self::Guest>) -> ws_hotel::Result<()> {
+    fn on_join(&mut self, mut cx: Context<Self::Guest>) -> ResultRelocation {
         let message = format!("[SERVER]: {} entered the room", cx.identity().as_str());
-        cx.broadcast(message)
+        cx.broadcast(message)?;
+
+        Ok(None)
     }
 
-    fn on_message(&mut self, mut cx: Context<Self::Guest>, msg: Message) -> ws::Result<()> {
+    fn on_message(&mut self, mut cx: Context<Self::Guest>, msg: Message) -> ResultRelocation {
         let name = cx.identity().as_str();
 
         let message = format!("{}: {}", name, msg.as_text().unwrap_or_default());
         cx.broadcast(&*message)?;
         self.message.push(message);
-        Ok(())
+
+        Ok(None)
     }
 
     fn on_leave(
@@ -75,29 +80,32 @@ pub fn main() {
             let msg = msg.as_text().unwrap_or_default();
 
             if username.is_none() {
-                return if let Some(username_msg) = msg.strip_prefix("/nick ") {
+                if let Some(username_msg) = msg.strip_prefix("/nick ") {
                     println!("{:?} is joining", username_msg);
                     *username = Some(username_msg.into());
-                    Ok(())
                 } else {
-                    cx.send("You haven't chosen a name yet")
-                };
+                    cx.send("You haven't chosen a name yet")?;
+                }
+
+                return Ok(None);
             }
 
             if let Some(room) = msg.strip_prefix("/join ") {
                 if let Some(username) = username.take() {
                     let room = chat_rooms.find_or_create_room(room);
-                    cx.relocate(room, username);
+                    let r = Relocation::new(room, username);
 
                     dbg!(&chat_rooms);
 
-                    Ok(())
+                    return Ok(Some(r));
                 } else {
-                    cx.send("You're not logged in !")
+                    cx.send("You're not logged in !")?;
                 }
             } else {
-                cx.send("Type `/join <room>` to join a chat room.")
+                cx.send("Type `/join <room>` to join a chat room.")?;
             }
+
+            Ok(None)
         }),
     );
 }
