@@ -16,6 +16,7 @@ pub use ws::{self, CloseCode, Handshake, Message, Result};
 ///
 /// It effectively contains a user-provided [`RoomHandler`] as R as well as a set of users that
 /// are in the room.
+#[derive(Eq)]
 pub struct Room<R: RoomHandler>(Arc<Mutex<RoomInner<R>>>);
 
 struct RoomInner<R: RoomHandler> {
@@ -129,6 +130,13 @@ where
             .field("[handler]", &lock.handler)
             .field("[members]", &lock.members)
             .finish()
+    }
+}
+
+/// Two rooms are equal if their inner [Arc] points to the same underlying data.
+impl<R: RoomHandler> PartialEq for Room<R> {
+    fn eq(&self, other: &Self) -> bool {
+        Arc::ptr_eq(&self.0, &other.0)
     }
 }
 
