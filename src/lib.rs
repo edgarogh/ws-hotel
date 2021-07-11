@@ -226,6 +226,17 @@ impl<Guest> Context<'_, '_, Guest> {
             .map(|(_, sender)| sender.send(msg.clone()))
             .collect()
     }
+
+    /// Sends a message to everyone in the same room by calling a closure for each member
+    pub fn broadcast_with<F: FnMut(&Guest) -> M, M: Into<Message>>(
+        &self,
+        mut f: F,
+    ) -> ws::Result<()> {
+        self.members_a
+            .iter()
+            .map(|(identity, sender)| sender.send(f(identity)))
+            .collect()
+    }
 }
 
 impl<Guest: Debug> Debug for Context<'_, '_, Guest> {
