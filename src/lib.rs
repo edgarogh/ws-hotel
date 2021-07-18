@@ -2,11 +2,15 @@
 //!
 //! _Your websocket server, with rooms._
 
+#![feature(arc_new_cyclic)]
+
 use std::any::Any;
 use std::fmt::{Debug, Formatter};
+use std::hash::{Hash, Hasher};
 use std::marker::PhantomData;
 use std::net::ToSocketAddrs;
-use std::sync::{Arc, Mutex};
+use std::ops::Deref;
+use std::sync::{Arc, Mutex, Weak};
 use ws::util::Token;
 use ws::Sender;
 
@@ -16,19 +20,116 @@ pub use ws::{self, CloseCode, Handshake, Message, Result};
 ///
 /// It effectively contains a user-provided [`RoomHandler`] as R as well as a set of users that
 /// are in the room.
-pub struct Room<R: RoomHandler>(Arc<Mutex<RoomInner<R>>>);
+pub struct RoomRef<R: RoomHandler>(Arc<Mutex<Room<R>>>);
 
-struct RoomInner<R: RoomHandler> {
+impl<R: RoomHandler> RoomRef<R> {
+    pub fn downgrade(&self) -> RoomRefWeak<R> {
+        RoomRefWeak(Arc::downgrade(&self.0))
+    }
+
+    /// Run code that needs access to the internal `RoomHandler`.
+    ///
+    /// Accessing it requires locking a Mutex, beware of deadlocks !
+    #[inline]
+    pub fn with<F: FnOnce(&mut R) -> T, T>(&self, f: F) -> T {
+        f(&mut self.0.lock().unwrap().handler)
+    }
+}
+
+impl<R: RoomHandler> Clone for RoomRef<R> {
+    fn clone(&self) -> Self {
+        Self(Arc::clone(&self.0))
+    }
+}
+
+impl<R: RoomHandler> From<R> for RoomRef<R> {
+    fn from(handler: R) -> Self {
+        Room::new(handler)
+    }
+}
+
+/// Two rooms are equal if their inner [Arc] points to the same underlying data.
+impl<R: RoomHandler> PartialEq for RoomRef<R> {
+    fn eq(&self, other: &Self) -> bool {
+        Arc::ptr_eq(&self.0, &other.0)
+    }
+}
+
+impl<R: RoomHandler> Eq for RoomRef<R> {}
+
+impl<R: RoomHandler> Hash for RoomRef<R> {
+    fn hash<H: Hasher>(&self, state: &mut H) {
+        let ptr = Arc::deref(&self.0) as *const _ as usize;
+        ptr.hash(state)
+    }
+}
+
+impl<R: RoomHandler> Debug for RoomRef<R>
+where
+    R: Debug,
+    R::Guest: Debug,
+{
+    fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
+        f.debug_tuple("RoomRef").field(&self.0).finish()
+    }
+}
+
+/// A weak [RoomRef] equivalent. Like with an [Arc], it must be [upgrade][RoomRefWeak::upgrade]d to
+/// be usable.
+pub struct RoomRefWeak<R: RoomHandler>(Weak<Mutex<Room<R>>>);
+
+impl<R: RoomHandler> RoomRefWeak<R> {
+    pub fn upgrade(&self) -> Option<RoomRef<R>> {
+        self.0.upgrade().map(RoomRef)
+    }
+}
+
+impl<R: RoomHandler> Clone for RoomRefWeak<R> {
+    fn clone(&self) -> Self {
+        Self(self.0.clone())
+    }
+}
+
+impl<R: RoomHandler> PartialEq for RoomRefWeak<R> {
+    fn eq(&self, other: &Self) -> bool {
+        Weak::ptr_eq(&self.0, &other.0)
+    }
+}
+
+impl<R: RoomHandler> PartialEq<RoomRef<R>> for RoomRefWeak<R> {
+    fn eq(&self, other: &RoomRef<R>) -> bool {
+        Weak::ptr_eq(&self.0, &Arc::downgrade(&other.0))
+    }
+}
+
+impl<R: RoomHandler> Eq for RoomRefWeak<R> {}
+
+impl<R: RoomHandler> Hash for RoomRefWeak<R> {
+    fn hash<H: Hasher>(&self, state: &mut H) {
+        let ptr = self.0.as_ptr() as usize;
+        ptr.hash(state)
+    }
+}
+
+impl<R: RoomHandler> Debug for RoomRefWeak<R>
+where
+    R: Debug,
+    R::Guest: Debug,
+{
+    fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
+        f.debug_tuple("RoomRefWeak").field(&self.0).finish()
+    }
+}
+
+pub struct Room<R: RoomHandler> {
+    self_ref: RoomRefWeak<R>,
+
     handler: R,
     members: Vec<(R::Guest, Sender)>,
 }
 
-impl<R: RoomHandler> RoomInner<R> {
-    fn with_context<F: FnOnce(&mut R, Context<R::Guest>) -> O, O>(
-        &mut self,
-        sender: &Sender,
-        f: F,
-    ) -> O {
+impl<R: RoomHandler> Room<R> {
+    fn with_context<F: FnOnce(&mut R, Context<R>) -> O, O>(&mut self, sender: &Sender, f: F) -> O {
         // TODO: remove
         //     Instead of allocating, use unsafe wrapper around HashMap that allows value mutation
         //     but no other kind of mutation. Thus, it will be possible to use `broadcast` or
@@ -41,6 +142,7 @@ impl<R: RoomHandler> RoomInner<R> {
             .collect::<Vec<_>>();
 
         let cx = Context {
+            room: &self.self_ref,
             sender,
             members: &todo,
             members_a: &mut self.members,
@@ -52,11 +154,13 @@ impl<R: RoomHandler> RoomInner<R> {
 }
 
 impl<R: RoomHandler> Room<R> {
-    /// Constructs a new empty [Room]
+    /// Constructs a new empty [RoomRef]
     ///
     /// Clients can be moved inside using [`Context::relocate`]:
     ///
     /// ```no_run
+    /// // TODO this whole example is broken
+    ///
     /// use ws_hotel::*;
     ///
     /// let room = AdHoc::new(|mut ctx: Context<String>, mut m: MembersAccess<String>, msg: Message| {
@@ -76,19 +180,14 @@ impl<R: RoomHandler> Room<R> {
     ///
     /// room.relocate(room, username);
     /// ```
-    pub fn new(handler: R) -> Self {
-        Self(Arc::new(Mutex::new(RoomInner {
-            handler,
-            members: Vec::new(),
-        })))
-    }
-
-    /// Run code that needs access to the internal `RoomHandler`.
-    ///
-    /// Accessing it requires locking a Mutex, beware of deadlocks !
-    #[inline]
-    pub fn with<F: FnOnce(&mut R) -> T, T>(&self, f: F) -> T {
-        f(&mut self.0.lock().unwrap().handler)
+    pub fn new(handler: R) -> RoomRef<R> {
+        RoomRef(Arc::new_cyclic(|weak| {
+            Mutex::new(Room {
+                self_ref: RoomRefWeak(weak.clone()),
+                handler,
+                members: Vec::new(),
+            })
+        }))
     }
 }
 
@@ -98,29 +197,18 @@ where
     R::Guest: Debug,
 {
     fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
-        let lock = self.0.lock().unwrap();
-
         f.debug_struct("Room")
-            .field("[handler]", &lock.handler)
-            .field("[members]", &lock.members)
+            .field("handler", &self.handler)
+            .field("members", &self.members)
             .finish()
     }
 }
-
-/// Two rooms are equal if their inner [Arc] points to the same underlying data.
-impl<R: RoomHandler> PartialEq for Room<R> {
-    fn eq(&self, other: &Self) -> bool {
-        Arc::ptr_eq(&self.0, &other.0)
-    }
-}
-
-impl<R: RoomHandler> Eq for Room<R> {}
 
 pub struct Relocation(Arc<dyn RoomAny>, Box<dyn Any>);
 
 impl Relocation {
     #[must_use]
-    pub fn new<R: RoomHandler>(room: &Room<R>, identity: R::Guest) -> Self
+    pub fn new<R: RoomHandler>(room: &RoomRef<R>, identity: R::Guest) -> Self
     where
         R: 'static,
         R::Guest: 'static,
@@ -142,7 +230,7 @@ trait RoomAny {
     fn remove(&self, sender: &Sender);
 }
 
-impl<R: RoomHandler + 'static> RoomAny for Mutex<RoomInner<R>> {
+impl<R: RoomHandler + 'static> RoomAny for Mutex<Room<R>> {
     fn on_join(&self, sender: &Sender) -> ResultRelocation {
         self.lock()
             .unwrap()
@@ -188,16 +276,23 @@ impl<R: RoomHandler + 'static> RoomAny for Mutex<RoomInner<R>> {
     }
 }
 
-pub struct Context<'a, 'm, Guest> {
+pub struct Context<'a, 'm, R: RoomHandler> {
+    room: &'a RoomRefWeak<R>,
+
     sender: &'a Sender,
-    members: &'a [(PhantomData<Guest>, Sender)],
-    members_a: &'m mut [(Guest, Sender)],
+    members: &'a [(PhantomData<R::Guest>, Sender)],
+    members_a: &'m mut [(R::Guest, Sender)],
     me: (Token, u32),
 }
 
-impl<Guest> Context<'_, '_, Guest> {
+impl<R: RoomHandler> Context<'_, '_, R> {
+    /// Weak reference to the current room
+    pub fn room(&self) -> &RoomRefWeak<R> {
+        self.room
+    }
+
     /// Returns the identity of the client associated with this [Context]
-    pub fn identity(&mut self) -> &mut Guest {
+    pub fn identity(&mut self) -> &mut R::Guest {
         // TODO memoize this function ? probably requires unsafe code
 
         let sender = self.me;
@@ -228,7 +323,7 @@ impl<Guest> Context<'_, '_, Guest> {
     }
 
     /// Sends a message to everyone in the same room by calling a closure for each member
-    pub fn broadcast_with<F: FnMut(&Guest) -> M, M: Into<Message>>(
+    pub fn broadcast_with<F: FnMut(&R::Guest) -> M, M: Into<Message>>(
         &self,
         mut f: F,
     ) -> ws::Result<()> {
@@ -239,7 +334,10 @@ impl<Guest> Context<'_, '_, Guest> {
     }
 }
 
-impl<Guest: Debug> Debug for Context<'_, '_, Guest> {
+impl<R: RoomHandler> Debug for Context<'_, '_, R>
+where
+    R::Guest: Debug,
+{
     fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
         // TODO memoize ? move into a non-mut function ? idk
 
@@ -255,7 +353,7 @@ impl<Guest: Debug> Debug for Context<'_, '_, Guest> {
         f.debug_struct("Context")
             .field("sender", &self.sender)
             .field("[identity]", identity)
-            .finish()
+            .finish_non_exhaustive()
     }
 }
 
@@ -307,7 +405,7 @@ impl ws::Handler for Handler {
 /// that can be associated with each an every member of the room, depending on the use case.
 ///
 /// [Guest]: RoomHandler::Guest
-pub trait RoomHandler {
+pub trait RoomHandler: Sized {
     /// Arbitrary piece of data that can be used to store room-kind-specific data for each member of
     /// the room.
     ///
@@ -322,14 +420,13 @@ pub trait RoomHandler {
     /// [Guest]: RoomHandler::Guest
     type Guest;
 
-    fn on_join(&mut self, _cx: Context<Self::Guest>) -> ResultRelocation {
+    fn on_join(&mut self, _cx: Context<Self>) -> ResultRelocation {
         Ok(None)
     }
 
-    fn on_message(&mut self, cx: Context<Self::Guest>, msg: Message) -> ResultRelocation;
+    fn on_message(&mut self, cx: Context<Self>, msg: Message) -> ResultRelocation;
 
-    fn on_leave(&mut self, _cx: Context<Self::Guest>, _code_and_reason: Option<(CloseCode, &str)>) {
-    }
+    fn on_leave(&mut self, _cx: Context<Self>, _code_and_reason: Option<(CloseCode, &str)>) {}
 }
 
 /// A simple [RoomHandler] that wraps a function or closure that will be called when receiving a
@@ -356,10 +453,10 @@ impl<F, G> Debug for AdHoc<F, G> {
     }
 }
 
-impl<Guest, F: FnMut(Context<Guest>, Message) -> ResultRelocation> RoomHandler for AdHoc<F, Guest> {
+impl<Guest, F: FnMut(Context<Self>, Message) -> ResultRelocation> RoomHandler for AdHoc<F, Guest> {
     type Guest = Guest;
 
-    fn on_message(&mut self, cx: Context<Self::Guest>, msg: Message) -> ResultRelocation {
+    fn on_message(&mut self, cx: Context<Self>, msg: Message) -> ResultRelocation {
         self.0(cx, msg)
     }
 }
@@ -369,16 +466,14 @@ impl<Guest, F: FnMut(Context<Guest>, Message) -> ResultRelocation> RoomHandler f
 ///
 /// The default room is where clients will be put when connecting the server. Its associated
 /// [`RoomHandler::Guest`] type must implement [`Default`], so it can be built implicitly.
-pub fn listen<A, R>(addr: A, lobby: R)
+pub fn listen<A, I, R>(addr: A, lobby: I)
 where
     A: ToSocketAddrs + std::fmt::Debug,
+    I: Into<RoomRef<R>>,
     R: RoomHandler + 'static,
     R::Guest: Default + 'static,
 {
-    let lobby = Room(Arc::new(Mutex::new(RoomInner {
-        handler: lobby,
-        members: Default::default(),
-    })));
+    let lobby = lobby.into();
 
     let lobby: Arc<dyn RoomAny> = Arc::clone(&lobby.0) as _;
 
